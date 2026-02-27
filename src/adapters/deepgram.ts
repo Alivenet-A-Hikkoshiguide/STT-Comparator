@@ -8,14 +8,10 @@ const DEEPGRAM_HTTP = 'https://api.deepgram.com/v1/listen';
 const DEFAULT_DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL ?? 'nova-3';
 const DEFAULT_DEEPGRAM_TIER = process.env.DEEPGRAM_TIER;
 const ENABLE_SMART_FORMAT = process.env.DEEPGRAM_SMART_FORMAT !== '0';
-const MAX_DEEPGRAM_BATCH_ATTEMPTS = 3;
 const IDLE_TIMEOUT_MS = 30_000;
 const HARD_TIMEOUT_MS = 5 * 60 * 1000;
 const STREAM_IDLE_TIMEOUT_MS = 30_000;
 const STREAM_BUFFER_HIGH_WATER_BYTES = 5 * 1024 * 1024;
-const RETRYABLE_STATUS_CODES = new Set([408, 429, 502, 503, 504]);
-const BASE_RETRY_DELAY_MS = 1000;
-const MAX_RETRY_DELAY_MS = 10_000;
 const DEFAULT_ENDPOINTING_MS = 400;
 
 const SUPPORTED_DEEPGRAM_LANGUAGES = [
@@ -139,29 +135,6 @@ function requireApiKey(): string {
     throw new Error('Deepgram API key is required. Set DEEPGRAM_API_KEY in .env');
   }
   return key;
-}
-
-function shouldRetryStatus(status: number): boolean {
-  return RETRYABLE_STATUS_CODES.has(status) || (status >= 500 && status < 600);
-}
-
-function shouldRetryError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  const text = error.message.toLowerCase();
-  return (
-    error.name === 'AbortError' ||
-    text.includes('timeout') ||
-    text.includes('failed to fetch') ||
-    text.includes('network')
-  );
-}
-
-function retryDelay(attempt: number): Promise<void> {
-  const jitter = Math.floor(Math.random() * 250);
-  const delay = Math.min(BASE_RETRY_DELAY_MS * 2 ** (attempt - 1) + jitter, MAX_RETRY_DELAY_MS);
-  return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
 async function collectStream(stream: NodeJS.ReadableStream): Promise<Buffer> {
@@ -451,6 +424,10 @@ export class DeepgramAdapter extends BaseAdapter {
     if ('destroy' in pcm && typeof (pcm as Readable).destroy === 'function') {
       (pcm as Readable).destroy();
     }
+    return this.transcribePcmBuffer(buffer, opts);
+  }
+
+  async transcribePcmBuffer(buffer: Buffer, opts: StreamingOptions): Promise<BatchResult> {
     const apiKey = requireApiKey();
     const language = normalizeDeepgramLanguage(opts.language);
     const query = new URLSearchParams({
@@ -474,39 +451,13 @@ export class DeepgramAdapter extends BaseAdapter {
       Authorization: `Token ${apiKey}`,
       'Content-Type': contentType,
     };
-    return this.sendBufferWithRetry(buffer, url, headers);
-  }
-
-  private async sendBufferWithRetry(
-    buffer: Buffer,
-    url: string,
-    headers: Record<string, string>
-  ): Promise<BatchResult> {
-    let lastError: Error | null = null;
-    for (let attempt = 1; attempt <= MAX_DEEPGRAM_BATCH_ATTEMPTS; attempt += 1) {
-      try {
-        const res = await this.postBuffer(buffer, url, headers);
-        if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          const error = new Error(`Deepgram batch failed: ${res.status} ${text}`);
-          if (!shouldRetryStatus(res.status) || attempt === MAX_DEEPGRAM_BATCH_ATTEMPTS) {
-            throw error;
-          }
-          lastError = error;
-          await retryDelay(attempt);
-          continue;
-        }
-        const json = (await res.json()) as DeepgramBatchResponse;
-        return this.parseBatchResult(json);
-      } catch (error) {
-        if (attempt === MAX_DEEPGRAM_BATCH_ATTEMPTS || !shouldRetryError(error)) {
-          throw error instanceof Error ? error : new Error('Deepgram batch failed');
-        }
-        lastError = error as Error;
-        await retryDelay(attempt);
-      }
+    const res = await this.postBuffer(buffer, url, headers);
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Deepgram batch failed: ${res.status} ${text}`);
     }
-    throw lastError ?? new Error('Deepgram batch failed');
+    const json = (await res.json()) as DeepgramBatchResponse;
+    return this.parseBatchResult(json);
   }
 
   private async postBuffer(

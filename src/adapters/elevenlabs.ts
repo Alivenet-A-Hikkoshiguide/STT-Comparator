@@ -12,35 +12,11 @@ import { BaseAdapter } from './base.js';
 import { normalizeIsoLanguageCode } from '../utils/language.js';
 
 const STREAMING_URL = 'wss://api.elevenlabs.io/v1/speech-to-text/realtime';
-const STREAMING_MODEL_ID = 'scribe_v2_realtime';
+const DEFAULT_STREAMING_MODEL_ID = 'scribe_v2_realtime';
 const BATCH_URL = 'https://api.elevenlabs.io/v1/speech-to-text';
-const BATCH_MODEL_ID = 'scribe_v1';
+const DEFAULT_BATCH_MODEL_ID = 'scribe_v2';
 const INCLUDE_TIMESTAMPED_COMMITS = true;
 const DEFAULT_BATCH_TIMEOUT_MS = 60_000;
-
-const ELEVENLABS_BATCH_MAX_ATTEMPTS = (() => {
-  const envValue = Number(process.env.ELEVENLABS_BATCH_MAX_ATTEMPTS);
-  if (Number.isFinite(envValue) && envValue >= 1) {
-    return envValue;
-  }
-  return 3;
-})();
-
-const ELEVENLABS_BATCH_BASE_DELAY_MS = (() => {
-  const envValue = Number(process.env.ELEVENLABS_BATCH_BASE_DELAY_MS);
-  if (Number.isFinite(envValue) && envValue > 0) {
-    return envValue;
-  }
-  return 1000;
-})();
-
-const ELEVENLABS_BATCH_MAX_DELAY_MS = (() => {
-  const envValue = Number(process.env.ELEVENLABS_BATCH_MAX_DELAY_MS);
-  if (Number.isFinite(envValue) && envValue > 0) {
-    return envValue;
-  }
-  return 5000;
-})();
 
 const ELEVENLABS_BATCH_TIMEOUT_MS = (() => {
   const envValue = Number(process.env.ELEVENLABS_BATCH_TIMEOUT_MS);
@@ -58,8 +34,6 @@ const AUDIO_FORMATS: Record<number, string> = {
   44100: 'pcm_44100',
   48000: 'pcm_48000',
 };
-
-const ELEVENLABS_BATCH_RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
 interface ElevenLabsStreamingEvent {
   message_type?: string;
@@ -89,6 +63,22 @@ function requireApiKey(): string {
     throw new Error('ElevenLabs API key is required. Set ELEVENLABS_API_KEY in .env');
   }
   return key;
+}
+
+function resolveModelId(value: string | undefined, fallback: string): string {
+  const normalized = value?.trim();
+  if (normalized) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function getStreamingModelId(): string {
+  return resolveModelId(process.env.ELEVENLABS_STT_STREAMING_MODEL_ID, DEFAULT_STREAMING_MODEL_ID);
+}
+
+function getBatchModelId(): string {
+  return resolveModelId(process.env.ELEVENLABS_STT_BATCH_MODEL_ID, DEFAULT_BATCH_MODEL_ID);
 }
 
 function getAudioFormat(sampleRate: number): string {
@@ -195,32 +185,6 @@ function wrapPcmBufferAsWav(buffer: Buffer, sampleRate: number, channels = 1, bi
   return Buffer.concat([header, buffer]);
 }
 
-function shouldRetryElevenLabsStatus(status: number): boolean {
-  return ELEVENLABS_BATCH_RETRYABLE_STATUS.has(status) || (status >= 500 && status < 600);
-}
-
-function shouldRetryElevenLabsError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  const text = error.message.toLowerCase();
-  return (
-    error.name === 'AbortError' ||
-    text.includes('timeout') ||
-    text.includes('failed to fetch') ||
-    text.includes('network')
-  );
-}
-
-function delayWithJitter(attempt: number): Promise<void> {
-  const baseDelay = Math.min(
-    ELEVENLABS_BATCH_BASE_DELAY_MS * 2 ** (attempt - 1),
-    ELEVENLABS_BATCH_MAX_DELAY_MS
-  );
-  const jitter = Math.floor(Math.random() * 250);
-  return new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
-}
-
 export class ElevenLabsAdapter extends BaseAdapter {
   id = 'elevenlabs' as const;
   supportsStreaming = true;
@@ -230,8 +194,9 @@ export class ElevenLabsAdapter extends BaseAdapter {
     const apiKey = requireApiKey();
     const audioFormat = getAudioFormat(opts.sampleRateHz);
     const commitStrategy = opts.enableVad ? 'vad' : 'manual';
+    const modelId = getStreamingModelId();
     const params = new URLSearchParams({
-      model_id: STREAMING_MODEL_ID,
+      model_id: modelId,
       audio_format: audioFormat,
       commit_strategy: commitStrategy,
       include_timestamps: INCLUDE_TIMESTAMPED_COMMITS ? 'true' : 'false',
@@ -409,8 +374,12 @@ export class ElevenLabsAdapter extends BaseAdapter {
     if ('destroy' in pcm && typeof (pcm as Readable).destroy === 'function') {
       (pcm as Readable).destroy();
     }
+    return this.transcribePcmBuffer(buffer, opts);
+  }
+
+  async transcribePcmBuffer(buffer: Buffer, opts: StreamingOptions): Promise<BatchResult> {
     const apiKey = requireApiKey();
-    const fields: Record<string, string> = { model_id: BATCH_MODEL_ID };
+    const fields: Record<string, string> = { model_id: getBatchModelId() };
     const normalizedLanguage = normalizeIsoLanguageCode(opts.language);
     if (normalizedLanguage) {
       fields.language_code = normalizedLanguage;
@@ -418,7 +387,7 @@ export class ElevenLabsAdapter extends BaseAdapter {
     const wavBuffer = wrapPcmBufferAsWav(buffer, opts.sampleRateHz);
     const fileContentType = 'audio/wav';
     const { body, contentType } = buildMultipartBody(fields, 'audio.wav', wavBuffer, fileContentType);
-    const json = await this.sendBatchWithRetry(body, contentType, apiKey);
+    const json = await this.sendBatchRequest(body, contentType, apiKey);
     const words = normalizeWords(json.words);
     return {
       provider: this.id,
@@ -429,52 +398,33 @@ export class ElevenLabsAdapter extends BaseAdapter {
     };
   }
 
-  private async sendBatchWithRetry(body: Buffer, contentType: string, apiKey: string): Promise<ElevenLabsBatchResponse> {
-    let lastError: Error | null = null;
-    for (let attempt = 1; attempt <= ELEVENLABS_BATCH_MAX_ATTEMPTS; attempt += 1) {
-      const abortController = new AbortController();
-      const timeout = setTimeout(() => abortController.abort(), ELEVENLABS_BATCH_TIMEOUT_MS);
-      try {
-        const response = await fetch(BATCH_URL, {
-          method: 'POST',
-          headers: {
-            'xi-api-key': apiKey,
-            'Content-Type': contentType,
-            'Content-Length': String(body.length),
-          },
-          body: new Uint8Array(body),
-          signal: abortController.signal,
-        });
-        if (!response.ok) {
-          const text = await response.text().catch(() => 'no details');
-          const error = new Error(`ElevenLabs batch failed: ${response.status} ${text}`);
-          if (!shouldRetryElevenLabsStatus(response.status) || attempt === ELEVENLABS_BATCH_MAX_ATTEMPTS) {
-            throw error;
-          }
-          lastError = error;
-          await delayWithJitter(attempt);
-          continue;
-        }
-        const json = (await response.json()) as ElevenLabsBatchResponse;
-        return json;
-      } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          const timeoutError = new Error(`ElevenLabs batch request timed out after ${ELEVENLABS_BATCH_TIMEOUT_MS}ms`);
-          if (attempt === ELEVENLABS_BATCH_MAX_ATTEMPTS) {
-            throw timeoutError;
-          }
-          lastError = timeoutError;
-        } else if (attempt === ELEVENLABS_BATCH_MAX_ATTEMPTS || !shouldRetryElevenLabsError(err)) {
-          throw err instanceof Error ? err : new Error('ElevenLabs batch failed');
-        } else {
-          lastError = err instanceof Error ? err : new Error('ElevenLabs batch failed');
-        }
-        await delayWithJitter(attempt);
-      } finally {
-        clearTimeout(timeout);
+  private async sendBatchRequest(body: Buffer, contentType: string, apiKey: string): Promise<ElevenLabsBatchResponse> {
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), ELEVENLABS_BATCH_TIMEOUT_MS);
+    try {
+      const response = await fetch(BATCH_URL, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey,
+          'Content-Type': contentType,
+          'Content-Length': String(body.length),
+        },
+        body: new Uint8Array(body),
+        signal: abortController.signal,
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => 'no details');
+        throw new Error(`ElevenLabs batch failed: ${response.status} ${text}`);
       }
+      return (await response.json()) as ElevenLabsBatchResponse;
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(`ElevenLabs batch request timed out after ${ELEVENLABS_BATCH_TIMEOUT_MS}ms`);
+      }
+      throw err instanceof Error ? err : new Error('ElevenLabs batch failed');
+    } finally {
+      clearTimeout(timeout);
     }
-    throw lastError ?? new Error('ElevenLabs batch failed');
   }
 
   private deriveDuration(words: TranscriptWord[] | undefined, json: ElevenLabsBatchResponse): number | undefined {

@@ -879,16 +879,6 @@ export class OpenAIAdapter extends BaseAdapter {
   }
 
   async transcribeFileFromPCM(pcm: NodeJS.ReadableStream, opts: StreamingOptions): Promise<BatchResult> {
-    const apiKey = requireApiKey();
-    const primaryModel = opts.batchModel ?? opts.model ?? getDefaultBatchModel();
-    const fallbackModel = opts.fallbackModel ?? getFallbackBatchModel();
-    const language = normalizeIsoLanguageCode(opts.language);
-
-    const sampleRateHz = opts.sampleRateHz ?? 16_000;
-    if (!Number.isFinite(sampleRateHz) || sampleRateHz <= 0) {
-      throw new Error(`invalid sampleRateHz: ${sampleRateHz}`);
-    }
-
     const controller = new AbortController();
 
     let aborted = false;
@@ -919,75 +909,7 @@ export class OpenAIAdapter extends BaseAdapter {
     try {
       const audioBuf = await collectStream(pcm, controller.signal);
       clearIdle();
-
-      const wav = createWavFromPcm16Mono(audioBuf, sampleRateHz);
-
-      const buildForm = (useModel: string) => {
-        const form = new FormData();
-        form.append('file', new Blob([new Uint8Array(wav)], { type: 'audio/wav' }), 'audio.wav');
-        form.append('model', useModel);
-        if (language) form.append('language', language);
-        if (opts.dictionaryPhrases?.length) form.append('prompt', opts.dictionaryPhrases.join(', '));
-        form.append('chunking_strategy', 'auto');
-
-        // Word timestamps require verbose_json, which is not supported by gpt-4o-transcribe / gpt-4o-mini-transcribe.
-        if (useModel === 'whisper-1') {
-          form.append('response_format', 'verbose_json');
-          form.append('timestamp_granularities[]', 'word');
-        } else {
-          form.append('response_format', 'json');
-        }
-
-        return form;
-      };
-
-      const callTranscribe = async (useModel: string) => {
-        const res = await fetch(OPENAI_AUDIO_TRANSCRIPTION, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: buildForm(useModel),
-          signal: controller.signal,
-        });
-        return res;
-      };
-
-      let res = await callTranscribe(primaryModel);
-
-      if (!res.ok && fallbackModel && fallbackModel !== primaryModel) {
-        const text = await res.text().catch(() => '');
-        if (OPENAI_DEBUG) {
-          logger.warn({
-            event: 'openai_batch_primary_failed',
-            status: res.status,
-            statusText: res.statusText,
-            body: text.slice(0, 800),
-          });
-        }
-        res = await callTranscribe(fallbackModel);
-      }
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`openai batch failed: ${res.status} ${text || res.statusText}`);
-      }
-
-      const payload = (await res.json()) as unknown;
-      const rec = isRecord(payload) ? payload : {};
-      const words = toTranscriptWords(rec.words) ?? toTranscriptWordsFromSegments(rec.segments);
-      const text =
-        typeof rec.text === 'string'
-          ? rec.text
-          : typeof rec.transcript === 'string'
-            ? rec.transcript
-            : '';
-
-      return {
-        provider: this.id,
-        text,
-        words,
-      };
+      return this.transcribeBufferedPcm(audioBuf, opts, controller);
     } finally {
       clearTimeout(hardTimer);
       clearIdle();
@@ -995,5 +917,98 @@ export class OpenAIAdapter extends BaseAdapter {
       pcm.off('end', clearIdle);
       pcm.off('close', clearIdle);
     }
+  }
+
+  async transcribePcmBuffer(pcm: Buffer, opts: StreamingOptions): Promise<BatchResult> {
+    const controller = new AbortController();
+    const hardTimer = setTimeout(
+      () => controller.abort(new Error('openai batch hard timeout')),
+      BATCH_HARD_TIMEOUT_MS
+    );
+    try {
+      return await this.transcribeBufferedPcm(pcm, opts, controller);
+    } finally {
+      clearTimeout(hardTimer);
+    }
+  }
+
+  private async transcribeBufferedPcm(
+    pcmBuffer: Buffer,
+    opts: StreamingOptions,
+    controller: AbortController
+  ): Promise<BatchResult> {
+    const apiKey = requireApiKey();
+    const primaryModel = opts.batchModel ?? opts.model ?? getDefaultBatchModel();
+    const fallbackModel = opts.fallbackModel ?? getFallbackBatchModel();
+    const language = normalizeIsoLanguageCode(opts.language);
+    const sampleRateHz = opts.sampleRateHz ?? 16_000;
+    if (!Number.isFinite(sampleRateHz) || sampleRateHz <= 0) {
+      throw new Error(`invalid sampleRateHz: ${sampleRateHz}`);
+    }
+
+    const wav = createWavFromPcm16Mono(pcmBuffer, sampleRateHz);
+
+    const buildForm = (useModel: string) => {
+      const form = new FormData();
+      form.append('file', new Blob([new Uint8Array(wav)], { type: 'audio/wav' }), 'audio.wav');
+      form.append('model', useModel);
+      if (language) form.append('language', language);
+      if (opts.dictionaryPhrases?.length) form.append('prompt', opts.dictionaryPhrases.join(', '));
+      form.append('chunking_strategy', 'auto');
+
+      // Word timestamps require verbose_json, which is not supported by gpt-4o-transcribe / gpt-4o-mini-transcribe.
+      if (useModel === 'whisper-1') {
+        form.append('response_format', 'verbose_json');
+        form.append('timestamp_granularities[]', 'word');
+      } else {
+        form.append('response_format', 'json');
+      }
+
+      return form;
+    };
+
+    const callTranscribe = async (useModel: string) => {
+      const res = await fetch(OPENAI_AUDIO_TRANSCRIPTION, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: buildForm(useModel),
+        signal: controller.signal,
+      });
+      return res;
+    };
+
+    let res = await callTranscribe(primaryModel);
+
+    if (!res.ok && fallbackModel && fallbackModel !== primaryModel) {
+      const text = await res.text().catch(() => '');
+      if (OPENAI_DEBUG) {
+        logger.warn({
+          event: 'openai_batch_primary_failed',
+          status: res.status,
+          statusText: res.statusText,
+          body: text.slice(0, 800),
+        });
+      }
+      res = await callTranscribe(fallbackModel);
+    }
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`openai batch failed: ${res.status} ${text || res.statusText}`);
+    }
+
+    const payload = (await res.json()) as unknown;
+    const rec = isRecord(payload) ? payload : {};
+    const words = toTranscriptWords(rec.words) ?? toTranscriptWordsFromSegments(rec.segments);
+    const text =
+      typeof rec.text === 'string' ? rec.text : typeof rec.transcript === 'string' ? rec.transcript : '';
+
+    return {
+      provider: this.id,
+      text,
+      words,
+    };
   }
 }

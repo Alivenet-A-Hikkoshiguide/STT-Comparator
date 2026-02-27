@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import type {
   BatchResult,
   ProviderAdapter,
@@ -17,4 +18,8 @@ export abstract class BaseAdapter implements ProviderAdapter {
     pcm: NodeJS.ReadableStream,
     opts: StreamingOptions
   ): Promise<BatchResult>;
+
+  transcribePcmBuffer(pcm: Buffer, opts: StreamingOptions): Promise<BatchResult> {
+    return this.transcribeFileFromPCM(Readable.from(pcm), opts);
+  }
 }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FileResult, JobHistoryEntry, JobStatus, JobSummary, SubmitBatchInput } from '../types/app';
+import { formatRejectedFilesMessage, partitionAudioFiles } from '../utils/audioUploadValidation';
 import type { RetryController } from './retryController';
 
 interface InternalConfig {
@@ -117,6 +118,14 @@ export const useBatchJobManager = ({ apiBase, retry, onJobLoaded }: InternalConf
       setJobSummary(null);
       setJobError(null);
 
+      const selectedFiles = Array.from(payload.files);
+      const { accepted, rejected } = partitionAudioFiles(selectedFiles);
+      if (rejected.length > 0 || accepted.length === 0) {
+        setJobError(formatRejectedFilesMessage(rejected.length > 0 ? rejected : selectedFiles));
+        setIsBatchRunning(false);
+        return;
+      }
+
       let manifestPayload: string | null = null;
       if (payload.manifestJson.trim()) {
         try {
@@ -142,7 +151,7 @@ export const useBatchJobManager = ({ apiBase, retry, onJobLoaded }: InternalConf
 
       try {
         const form = new FormData();
-        for (const file of Array.from(payload.files)) {
+        for (const file of accepted) {
           const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
           const uploadName = relativePath && relativePath.length > 0 ? relativePath : file.name;
           form.append('files', file, uploadName);
@@ -168,12 +177,30 @@ export const useBatchJobManager = ({ apiBase, retry, onJobLoaded }: InternalConf
         const res = await fetch(`${apiBase}/api/jobs/transcribe`, { method: 'POST', body: form });
         if (!res.ok) {
           const errText = await res.text();
+          let parsed: {
+            message?: string;
+            invalidFiles?: Array<{ originalname?: string }>;
+          } | null = null;
           try {
-            const parsed = JSON.parse(errText);
-            throw new Error(parsed.message ?? 'ジョブ投入に失敗しました');
+            parsed = JSON.parse(errText) as {
+              message?: string;
+              invalidFiles?: Array<{ originalname?: string }>;
+            };
           } catch {
-            throw new Error('ジョブ投入に失敗しました');
+            parsed = null;
           }
+
+          if (parsed) {
+            if (Array.isArray(parsed.invalidFiles) && parsed.invalidFiles.length > 0) {
+              const names = parsed.invalidFiles
+                .slice(0, 3)
+                .map((item) => item.originalname ?? '(unknown)');
+              const suffix = parsed.invalidFiles.length > 3 ? ` ほか${parsed.invalidFiles.length - 3}件` : '';
+              throw new Error(`${parsed.message ?? 'ジョブ投入に失敗しました'}: ${names.join(', ')}${suffix}`);
+            }
+            throw new Error(parsed.message ?? 'ジョブ投入に失敗しました');
+          }
+          throw new Error('ジョブ投入に失敗しました');
         }
         const data = await res.json();
         setJobError(null);

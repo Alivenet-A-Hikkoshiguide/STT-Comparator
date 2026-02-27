@@ -28,9 +28,8 @@ import type {
   VoiceUserTranscriptMessage,
 } from '../types.js';
 import { generateChatReply } from '../voice/openaiResponses.js';
-import { streamTtsPcm } from '../voice/elevenlabsTts.js';
-import { streamOpenAiTtsPcm } from '../voice/openaiTts.js';
 import { resolveVoicePreset } from '../voice/voicePresets.js';
+import { createTtsStream } from '../voice/ttsPipeline.js';
 import type { OpenAiRealtimeVoiceSession } from '../voice/openaiRealtimeVoice.js';
 import { startOpenAiRealtimeVoiceSession } from '../voice/openaiRealtimeVoice.js';
 
@@ -127,6 +126,32 @@ const clampInt = (value: number | undefined, min: number, max: number, fallback:
   return Math.min(max, Math.max(min, safe));
 };
 
+const normalizeErrorCause = (cause: unknown): unknown => {
+  if (!cause) return undefined;
+  if (cause instanceof Error) {
+    return { name: cause.name, message: cause.message, stack: cause.stack };
+  }
+  return cause;
+};
+
+const coerceError = (err: unknown, fallback: string): Error => {
+  if (err instanceof Error) return err;
+  if (typeof err === 'string' && err.trim()) return new Error(err);
+  return new Error(fallback);
+};
+
+const logVoiceError = (event: 'voice_agent_error' | 'voice_intro_error', err: unknown, fallback: string): Error => {
+  const error = coerceError(err, fallback);
+  logger.error({
+    event,
+    message: error.message,
+    name: error.name,
+    cause: normalizeErrorCause(error.cause),
+    stack: error.stack,
+  });
+  return error;
+};
+
 const normalizeEchoText = (text: string): string =>
   text.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 
@@ -158,6 +183,7 @@ const jaccardSimilarity = (a: string, b: string): number => {
 
 export async function handleVoiceConnection(ws: WebSocket, lang: string) {
   const config = await loadConfig();
+  const ttsConfig = config.voice?.tts;
   const voiceVad = config.voice?.vad;
   const meetingGate = createMeetingAudioGate(config.voice?.meetingGate);
   const sessionId = randomUUID();
@@ -538,7 +564,8 @@ export async function handleVoiceConnection(ws: WebSocket, lang: string) {
       if (!isActiveTurn()) {
         return;
       }
-      if (!ttsProvider) {
+      const provider = ttsProvider;
+      if (!provider) {
         throw new Error('voice session is not initialized (missing tts provider)');
       }
 
@@ -561,10 +588,14 @@ export async function handleVoiceConnection(ws: WebSocket, lang: string) {
       let audioBytes = 0;
       let startedSpeaking = false;
 
-      const ttsStream =
-        ttsProvider === 'openai'
-          ? streamOpenAiTtsPcm(assistantText, { signal: abort.signal, sampleRate: outputSampleRate })
-          : streamTtsPcm(assistantText, { signal: abort.signal, lang, sampleRate: outputSampleRate });
+      const { stream: ttsStream, stats: ttsStats } = createTtsStream({
+        provider,
+        text: assistantText,
+        lang,
+        sampleRate: outputSampleRate,
+        signal: abort.signal,
+        config: ttsConfig,
+      });
 
       for await (const pcm of ttsStream) {
         if (abort.signal.aborted || closed) break;
@@ -605,6 +636,9 @@ export async function handleVoiceConnection(ws: WebSocket, lang: string) {
           audioChunks,
           audioBytes,
           outputSampleRate,
+          ttsStrategy: ttsStats.strategy,
+          ttsSegments: ttsStats.segments,
+          ttsRetries: ttsStats.retries,
         });
       }
     } catch (err) {
@@ -614,12 +648,11 @@ export async function handleVoiceConnection(ws: WebSocket, lang: string) {
       if (!isActiveTurn()) {
         return;
       }
-      const message = err instanceof Error ? err.message : 'voice agent error';
-      logger.error({ event: 'voice_agent_error', message });
+      const error = logVoiceError('voice_agent_error', err, 'voice agent error');
       if (assistantTurn?.state === 'speaking') {
         sendAudioEnd(turnId, 'error');
       }
-      sendJson({ type: 'error', message });
+      sendJson({ type: 'error', message: error.message });
     } finally {
       if (isActiveTurn()) {
         assistantTurn = null;
@@ -634,7 +667,8 @@ export async function handleVoiceConnection(ws: WebSocket, lang: string) {
   const speakAssistantText = async (assistantText: string) => {
     if (closed) return;
     if (assistantTurn) return;
-    if (!ttsProvider) return;
+    const provider = ttsProvider;
+    if (!provider) return;
     const trimmed = assistantText.trim();
     if (!trimmed) return;
 
@@ -661,10 +695,14 @@ export async function handleVoiceConnection(ws: WebSocket, lang: string) {
     let startedSpeaking = false;
 
     try {
-      const ttsStream =
-        ttsProvider === 'openai'
-          ? streamOpenAiTtsPcm(trimmed, { signal: abort.signal, sampleRate: outputSampleRate })
-          : streamTtsPcm(trimmed, { signal: abort.signal, lang, sampleRate: outputSampleRate });
+      const { stream: ttsStream, stats: ttsStats } = createTtsStream({
+        provider,
+        text: trimmed,
+        lang,
+        sampleRate: outputSampleRate,
+        signal: abort.signal,
+        config: ttsConfig,
+      });
 
       for await (const pcm of ttsStream) {
         if (abort.signal.aborted || closed) break;
@@ -703,6 +741,9 @@ export async function handleVoiceConnection(ws: WebSocket, lang: string) {
           audioChunks,
           audioBytes,
           outputSampleRate,
+          ttsStrategy: ttsStats.strategy,
+          ttsSegments: ttsStats.segments,
+          ttsRetries: ttsStats.retries,
         });
       }
     } catch (err) {
@@ -712,12 +753,11 @@ export async function handleVoiceConnection(ws: WebSocket, lang: string) {
       if (!isActiveTurn()) {
         return;
       }
-      const message = err instanceof Error ? err.message : 'voice agent error';
-      logger.error({ event: 'voice_intro_error', message });
+      const error = logVoiceError('voice_intro_error', err, 'voice agent error');
       if (assistantTurn?.state === 'speaking') {
         sendAudioEnd(turnId, 'error');
       }
-      sendJson({ type: 'error', message });
+      sendJson({ type: 'error', message: error.message });
     } finally {
       if (isActiveTurn()) {
         assistantTurn = null;

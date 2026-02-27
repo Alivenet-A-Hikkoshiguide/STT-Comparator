@@ -1,14 +1,19 @@
-import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { appendFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import type { StorageDriver } from '../types.js';
 import type { RetentionPolicy } from './retention.js';
+import { logger } from '../logger.js';
 
 export class JsonlStore<T> implements StorageDriver<T> {
   private readonly retentionMs: number | undefined;
   private readonly maxRows: number | undefined;
   private readonly pruneIntervalMs: number;
   private lastPruned = 0;
+  private pruneInFlight: Promise<void> | null = null;
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(private filepath: string, retention?: RetentionPolicy) {
     this.retentionMs = retention?.retentionMs;
@@ -21,43 +26,92 @@ export class JsonlStore<T> implements StorageDriver<T> {
   }
 
   async append(record: T): Promise<void> {
-    await appendFile(this.filepath, `${JSON.stringify(record)}\n`);
-    await this.maybePrune(record);
+    await this.enqueueWrite(async () => {
+      await appendFile(this.filepath, `${JSON.stringify(record)}\n`);
+      this.schedulePrune(record);
+    });
   }
 
   async readAll(): Promise<T[]> {
-    try {
-      const data = await readFile(this.filepath, 'utf-8');
-      return data
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as T);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-      throw error;
-    }
+    await this.waitForWrites();
+    return this.readAllInternal();
+  }
+
+  private async readAllInternal(): Promise<T[]> {
+    const records: T[] = [];
+    await this.forEachRecord((record) => {
+      records.push(record);
+    });
+    return records;
   }
 
   async readRecent(limit: number): Promise<T[]> {
-    const all = await this.readAll();
-    if (limit <= 0) return all;
-    return all.slice(-limit).reverse();
+    await this.waitForWrites();
+    if (limit <= 0) {
+      return this.readAll();
+    }
+    const ring: T[] = [];
+    await this.forEachRecord((record) => {
+      if (ring.length >= limit) {
+        ring.shift();
+      }
+      ring.push(record);
+    });
+    return ring.reverse();
   }
 
   async readByJob(jobId: string): Promise<T[]> {
-    const all = await this.readAll();
-    return all
-      .filter((row): row is T & { jobId?: string } => (row as { jobId?: string }).jobId === jobId)
-      .reverse();
+    await this.waitForWrites();
+    const rows: T[] = [];
+    await this.forEachRecord((record) => {
+      const candidate = record as { jobId?: string };
+      if (candidate.jobId === jobId) {
+        rows.push(record);
+      }
+    });
+    return rows.reverse();
   }
 
-  private async maybePrune(_sampleRecord?: T): Promise<void> {
+  async listJobIds(): Promise<string[]> {
+    await this.waitForWrites();
+    const ids = new Set<string>();
+    await this.forEachRecord((record) => {
+      const candidate = record as { jobId?: string };
+      const jobId = candidate.jobId;
+      if (typeof jobId === 'string' && jobId.length > 0) {
+        ids.add(jobId);
+      }
+    });
+    return [...ids];
+  }
+
+  private schedulePrune(_sampleRecord?: T): void {
     if (!this.retentionMs && !this.maxRows) return;
+    if (this.pruneInFlight) return;
     const now = Date.now();
     if (now - this.lastPruned < this.pruneIntervalMs) return;
     this.lastPruned = now;
 
-    const all = await this.readAll();
+    this.pruneInFlight = this.enqueueWrite(() => this.runPrune()).finally(() => {
+      this.pruneInFlight = null;
+    });
+  }
+
+  private async runPrune(): Promise<void> {
+    try {
+      await this.maybePrune();
+    } catch (error) {
+      logger.warn({
+        event: 'jsonl_prune_failed',
+        filepath: this.filepath,
+        message: error instanceof Error ? error.message : 'unknown prune error',
+      });
+    }
+  }
+
+  private async maybePrune(): Promise<void> {
+    const now = Date.now();
+    const all = await this.readAllInternal();
     if (all.length === 0) return;
 
     const cutoff = this.retentionMs ? new Date(now - this.retentionMs) : null;
@@ -82,6 +136,19 @@ export class JsonlStore<T> implements StorageDriver<T> {
     }
   }
 
+  private enqueueWrite(task: () => Promise<void>): Promise<void> {
+    const operation = this.writeChain.then(task, task);
+    this.writeChain = operation.catch(() => undefined);
+    return operation;
+  }
+
+  private async waitForWrites(): Promise<void> {
+    await this.writeChain;
+    if (this.pruneInFlight) {
+      await this.pruneInFlight;
+    }
+  }
+
   private extractTimestamp(row: T): number | null {
     const candidateRecord = row as {
       createdAt?: string;
@@ -96,5 +163,33 @@ export class JsonlStore<T> implements StorageDriver<T> {
       candidateRecord.recordedAt;
     const ts = candidate ? Date.parse(candidate as string) : NaN;
     return Number.isFinite(ts) ? ts : null;
+  }
+
+  private parseLine(line: string): T {
+    try {
+      return JSON.parse(line) as T;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'failed to parse JSONL line';
+      throw new Error(`invalid JSONL row: ${message}`);
+    }
+  }
+
+  private async forEachRecord(visitor: (record: T) => void): Promise<void> {
+    try {
+      const stream = createReadStream(this.filepath, { encoding: 'utf-8' });
+      const rl = createInterface({
+        input: stream,
+        crlfDelay: Infinity,
+      });
+      for await (const line of rl) {
+        if (!line) continue;
+        visitor(this.parseLine(line));
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return;
+      }
+      throw error;
+    }
   }
 }

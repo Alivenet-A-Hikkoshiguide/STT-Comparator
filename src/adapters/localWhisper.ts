@@ -4,6 +4,8 @@ import { once } from 'node:events';
 import { unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
+import { buffer as streamToBuffer } from 'node:stream/consumers';
 import { pipeline } from 'node:stream/promises';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import type { BatchResult, StreamingOptions, StreamingSession, TranscriptWord } from '../types.js';
@@ -77,9 +79,11 @@ export class LocalWhisperAdapter extends BaseAdapter {
       throw new Error(runtime.reason ?? 'Whisper runtime is not available');
     }
 
-    const wavPath = await this.toWavFile(pcm, opts.sampleRateHz, opts.encoding);
+    const pcmBuffer = await streamToBuffer(pcm);
+    const whisperLanguage = normalizeWhisperLanguage(opts.language);
+    let wavPath: string | null = null;
     try {
-      const whisperLanguage = normalizeWhisperLanguage(opts.language);
+      wavPath = await this.toWavFile(Readable.from(pcmBuffer), opts.sampleRateHz, opts.encoding);
       const result = await this.runWhisper(runtime.pythonPath, wavPath, whisperLanguage ?? '');
       return {
         provider: this.id,
@@ -88,8 +92,12 @@ export class LocalWhisperAdapter extends BaseAdapter {
         durationSec: typeof result.durationSec === 'number' ? result.durationSec : undefined,
         vendorProcessingMs: typeof result.vendorProcessingMs === 'number' ? result.vendorProcessingMs : undefined,
       } satisfies BatchResult;
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(typeof error === 'string' ? error : 'local_whisper failed');
     } finally {
-      void unlink(wavPath).catch(() => undefined);
+      if (wavPath) {
+        await unlink(wavPath).catch(() => undefined);
+      }
     }
   }
 
@@ -121,11 +129,18 @@ export class LocalWhisperAdapter extends BaseAdapter {
       { stdio: ['pipe', 'ignore', 'inherit'] }
     );
 
-    const timeout = setTimeout(() => ffmpeg.kill('SIGKILL'), PCM_TO_WAV_TIMEOUT_MS);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      ffmpeg.kill('SIGKILL');
+    }, PCM_TO_WAV_TIMEOUT_MS);
     try {
       await pipeline(pcm, ffmpeg.stdin as NodeJS.WritableStream);
       const [code] = (await once(ffmpeg, 'close')) as [number | null];
       if (code !== 0) {
+        if (timedOut) {
+          throw new Error(`ffmpeg timeout after ${PCM_TO_WAV_TIMEOUT_MS}ms`);
+        }
         throw new Error(`ffmpeg exited with code ${code ?? 'unknown'}`);
       }
       return wavPath;
@@ -155,11 +170,18 @@ export class LocalWhisperAdapter extends BaseAdapter {
       stderr += chunk.toString();
     });
 
-    const timer = setTimeout(() => child.kill('SIGKILL'), WHISPER_TIMEOUT_MS);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, WHISPER_TIMEOUT_MS);
     const [code] = (await once(child, 'close')) as [number | null];
     clearTimeout(timer);
 
     if (code !== 0) {
+      if (timedOut) {
+        throw new Error(`Whisper process timeout after ${WHISPER_TIMEOUT_MS}ms`);
+      }
       throw new Error(`Whisper process failed (code ${code ?? 'unknown'}): ${stderr || stdout}`);
     }
 

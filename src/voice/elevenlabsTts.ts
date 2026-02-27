@@ -8,7 +8,7 @@ const DEFAULT_FALLBACK_OUTPUT_FORMAT = 'mp3_22050_32';
 const DEFAULT_PCM_SAMPLE_RATES = new Set([16_000, 22_050, 24_000, 44_100]);
 const DEFAULT_JA_MODEL_ID = 'eleven_multilingual_v2';
 
-class ElevenLabsTtsHttpError extends Error {
+export class ElevenLabsTtsHttpError extends Error {
   status: number;
 
   constructor(status: number, message: string) {

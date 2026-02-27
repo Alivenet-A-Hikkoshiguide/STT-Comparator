@@ -4,6 +4,9 @@ import { z } from 'zod';
 import { PROVIDER_IDS } from './types.js';
 import type { ProviderId } from './types.js';
 
+export const FAIR_SAMPLE_RATE_HZ = 16_000;
+export const FAIR_CHANNELS = 1;
+
 const normalizationSchema = z.object({
   nfkc: z.boolean().optional(),
   stripPunct: z.boolean().optional(),
@@ -14,8 +17,20 @@ const normalizationSchema = z.object({
 const ingressNormalizeSchema = z
   .object({
     enabled: z.boolean().optional(),
-    targetSampleRate: z.number().optional(),
-    targetChannels: z.number().optional(),
+    targetSampleRate: z
+      .number()
+      .int()
+      .refine((value) => value === FAIR_SAMPLE_RATE_HZ, {
+        message: `ingressNormalize.targetSampleRate must be ${FAIR_SAMPLE_RATE_HZ}`,
+      })
+      .optional(),
+    targetChannels: z
+      .number()
+      .int()
+      .refine((value) => value === FAIR_CHANNELS, {
+        message: `ingressNormalize.targetChannels must be ${FAIR_CHANNELS}`,
+      })
+      .optional(),
     peakDbfs: z.number().optional(),
     maxDurationSec: z.number().min(0.1).max(3600).optional(),
   })
@@ -76,6 +91,17 @@ const voiceMeetingSchema = z
   .partial()
   .default({});
 
+const voiceTtsSchema = z
+  .object({
+    strategy: z.enum(['stream', 'segment-buffered']).optional(),
+    segmentMinChars: z.number().int().min(10).max(400).optional(),
+    segmentMaxChars: z.number().int().min(20).max(800).optional(),
+    retryMax: z.number().int().min(0).max(5).optional(),
+    retryBaseMs: z.number().int().min(50).max(5000).optional(),
+  })
+  .partial()
+  .default({});
+
 const voiceSchema = z
   .object({
     presets: z.array(voicePresetSchema).min(1).max(20).optional(),
@@ -84,14 +110,15 @@ const voiceSchema = z
     vad: voiceVadSchema.optional(),
     meetingGate: voiceMeetingGateSchema.optional(),
     meeting: voiceMeetingSchema.optional(),
+    tts: voiceTtsSchema.optional(),
   })
   .partial()
   .default({});
 
 export const configSchema = z.object({
   audio: z.object({
-    targetSampleRate: z.number().default(16000),
-    targetChannels: z.number().default(1),
+    targetSampleRate: z.literal(FAIR_SAMPLE_RATE_HZ).default(FAIR_SAMPLE_RATE_HZ),
+    targetChannels: z.literal(FAIR_CHANNELS).default(FAIR_CHANNELS),
     chunkMs: z.number().default(250),
   }),
   ingressNormalize: ingressNormalizeSchema.optional(),
@@ -108,8 +135,23 @@ export const configSchema = z.object({
     .object({
       maxParallel: z.number().min(1).max(64).default(4),
       retentionMs: z.number().min(0).default(10 * 60 * 1000),
+      persistenceMode: z.literal('required').default('required'),
+      stateDbPath: z
+        .string()
+        .min(1)
+        .refine((value) => !value.includes('{date}'), {
+          message: 'jobs.stateDbPath must not include {date}',
+        })
+        .default('./runs/job-state/batch-jobs.sqlite'),
+      providerMaxParallel: z.record(z.enum(PROVIDER_IDS), z.number().int().min(1).max(64)).optional(),
+      retry: z
+        .object({
+          maxAttempts: z.number().int().min(1).max(8).default(3),
+          baseDelayMs: z.number().int().min(100).max(30_000).default(1000),
+          maxDelayMs: z.number().int().min(100).max(60_000).default(10_000),
+        })
+        .default({}),
     })
-    .partial()
     .default({}),
   ws: z
     .object({
@@ -124,9 +166,16 @@ export const configSchema = z.object({
         })
         .partial()
         .default({}),
+      preview: z
+        .object({
+          maxUploadBytes: z.number().int().min(1 * 1024 * 1024).max(1024 * 1024 * 1024).optional(),
+        })
+        .partial()
+        .default({}),
       replay: z
         .object({
           minDurationMs: z.number().int().min(0).max(10_000).optional(),
+          maxUploadBytes: z.number().int().min(1 * 1024 * 1024).max(1024 * 1024 * 1024).optional(),
         })
         .partial()
         .default({}),
@@ -144,6 +193,8 @@ export const configSchema = z.object({
   providerHealth: z
     .object({
       refreshMs: z.number().int().min(1).optional(),
+      failureThreshold: z.number().int().min(1).max(20).optional(),
+      cooldownMs: z.number().int().min(1_000).max(10 * 60_000).optional(),
     })
     .default({}),
   providerLimits: z

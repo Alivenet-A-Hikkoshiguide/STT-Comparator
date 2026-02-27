@@ -25,10 +25,23 @@ const manifestSchema = z.object({
 
 export class ManifestMatchError extends Error {
   code: 'MANIFEST_AMBIGUOUS';
+  details?: {
+    filename?: string;
+    basename?: string;
+    candidates?: string[];
+  };
 
-  constructor(message: string) {
+  constructor(
+    message: string,
+    details?: {
+      filename?: string;
+      basename?: string;
+      candidates?: string[];
+    }
+  ) {
     super(message);
     this.code = 'MANIFEST_AMBIGUOUS';
+    this.details = details;
   }
 }
 
@@ -43,9 +56,13 @@ export function parseManifest(json: string): EvaluationManifest {
   return manifestSchema.parse(JSON.parse(json));
 }
 
+function toBasename(value: string): string {
+  return path.posix.basename(normalizeAudioPath(value) || value);
+}
+
 export function matchManifestItem(manifest: EvaluationManifest, filename: string) {
   const normalizedFilename = normalizeAudioPath(filename);
-  const filenameBase = path.posix.basename(normalizedFilename || filename);
+  const filenameBase = toBasename(filename);
 
   const exactMatch = manifest.items.find(
     (item) => normalizeAudioPath(item.audio) === normalizedFilename
@@ -54,20 +71,71 @@ export function matchManifestItem(manifest: EvaluationManifest, filename: string
     return exactMatch;
   }
 
-  if (manifest.allowBasenameFallback !== true) {
+  if (manifest.allowBasenameFallback === false) {
     return undefined;
   }
 
   const basenameMatches = manifest.items.filter((item) => {
-    const itemBase = path.posix.basename(normalizeAudioPath(item.audio) || item.audio);
+    const itemBase = toBasename(item.audio);
     return itemBase === filenameBase;
   });
 
   if (basenameMatches.length > 1) {
+    const candidates = basenameMatches
+      .map((item) => normalizeAudioPath(item.audio))
+      .filter((entry) => entry.length > 0);
     throw new ManifestMatchError(
-      `ambiguous manifest match for "${filenameBase}" (${basenameMatches.length} candidates)`
+      `ambiguous manifest match for "${filenameBase}" (${basenameMatches.length} candidates)`,
+      {
+        filename,
+        basename: filenameBase,
+        candidates,
+      }
     );
   }
 
   return basenameMatches[0];
+}
+
+export interface ManifestCoverageValidation {
+  missingFiles: string[];
+  ambiguousFiles: Array<{
+    filename: string;
+    basename: string;
+    candidates: string[];
+  }>;
+}
+
+export function validateManifestCoverage(
+  manifest: EvaluationManifest,
+  filenames: readonly string[]
+): ManifestCoverageValidation {
+  const missingFiles: string[] = [];
+  const ambiguousFiles: ManifestCoverageValidation['ambiguousFiles'] = [];
+
+  for (const filename of filenames) {
+    try {
+      const matched = matchManifestItem(manifest, filename);
+      if (!matched) {
+        missingFiles.push(filename);
+      }
+    } catch (error) {
+      if (error instanceof ManifestMatchError) {
+        ambiguousFiles.push({
+          filename,
+          basename:
+            typeof error.details?.basename === 'string'
+              ? error.details.basename
+              : toBasename(filename),
+          candidates: Array.isArray(error.details?.candidates)
+            ? error.details.candidates.filter((entry) => typeof entry === 'string')
+            : [],
+        });
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  return { missingFiles, ambiguousFiles };
 }

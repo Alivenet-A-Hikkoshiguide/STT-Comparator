@@ -39,4 +39,24 @@ describe('LocalWhisperAdapter', () => {
     expect(res.vendorProcessingMs).toBe(expected.vendorProcessingMs);
     expect(res.words?.[0]?.text).toBe('hello');
   });
+
+  it('does not retry inside adapter for transient failures', async () => {
+    const { LocalWhisperAdapter } = await import('./localWhisper.js');
+    const adapter = new LocalWhisperAdapter();
+    const wavPath = '/tmp/retry.wav';
+
+    vi.spyOn(adapter as any, 'toWavFile').mockResolvedValue(wavPath);
+    const runSpy = vi
+      .spyOn(adapter as any, 'runWhisper')
+      .mockRejectedValueOnce(new Error('Whisper process timeout after 100ms'));
+
+    await expect(
+      adapter.transcribeFileFromPCM(Readable.from(Buffer.from([1, 2, 3])), {
+        language: 'ja-JP',
+        sampleRateHz: 16000,
+        encoding: 'linear16',
+      })
+    ).rejects.toThrow('Whisper process timeout');
+    expect(runSpy).toHaveBeenCalledTimes(1);
+  });
 });

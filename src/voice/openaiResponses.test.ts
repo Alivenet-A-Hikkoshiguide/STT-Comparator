@@ -104,7 +104,10 @@ describe('generateChatReply', () => {
     vi.resetModules();
     const { generateChatReply } = await import('./openaiResponses.js');
 
-    const fetchMock = vi.fn(async () => ({
+    let capturedInit: RequestInit | undefined;
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      capturedInit = init;
+      return {
       ok: true,
       json: async () => ({
         output: [
@@ -129,7 +132,8 @@ describe('generateChatReply', () => {
           },
         ],
       }),
-    }));
+      };
+    });
     vi.stubGlobal('fetch', fetchMock as any);
 
     const reply = await generateChatReply([{ role: 'user', content: 'hi' }], { instructions: 'sys' });
@@ -137,7 +141,7 @@ describe('generateChatReply', () => {
     expect(reply.citations).toEqual([
       { url: 'https://example.com', title: 'Example', startIndex: 0, endIndex: 5 },
     ]);
-    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? '{}')) as Record<string, unknown>;
+    const body = JSON.parse(String(capturedInit?.body ?? '{}')) as Record<string, unknown>;
     expect(body.instructions).toBe('sys');
     expect(body.input).toEqual([{ role: 'user', content: 'hi' }]);
     expect(body.temperature).toBeUndefined();

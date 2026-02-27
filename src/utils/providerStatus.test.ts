@@ -49,7 +49,7 @@ const baseConfig: AppConfig = {
   normalization: {},
   storage: { driver: 'jsonl', path: './runs', retentionDays: 30, maxRows: 100000 },
   providers: ['local_whisper'],
-  jobs: {},
+  jobs: { maxParallel: 4, retentionMs: 10 * 60 * 1000, retry: { maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 10_000 } },
   ws: {},
   providerHealth: {},
   providerLimits: {},

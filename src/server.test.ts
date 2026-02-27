@@ -1,6 +1,9 @@
 import type { Request, Response } from 'express';
 import { describe, expect, it, vi } from 'vitest';
-import { createRealtimeLatencyHandler } from './server.js';
+import { mkdtemp, writeFile, access } from 'node:fs/promises';
+import path from 'node:path';
+import { tmpdir } from 'node:os';
+import { cleanupUploadedFiles, createRealtimeLatencyHandler } from './server.js';
 import type { RealtimeLatencySummary, StorageDriver } from './types.js';
 
 const sampleSummary = (overrides: Partial<RealtimeLatencySummary> = {}): RealtimeLatencySummary => ({
@@ -93,5 +96,23 @@ describe('GET /api/realtime/latency', () => {
 
     await callLatencyHandler(handler, { limit: '500' });
     expect(driver.readRecent).toHaveBeenCalledWith(50); // clamped
+  });
+});
+
+describe('cleanupUploadedFiles', () => {
+  it('deletes uploaded temp files safely', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'stt-upload-cleanup-'));
+    const fileA = path.join(dir, 'a.tmp');
+    const fileB = path.join(dir, 'b.tmp');
+    await writeFile(fileA, 'a');
+    await writeFile(fileB, 'b');
+
+    await cleanupUploadedFiles([
+      { path: fileA } as Express.Multer.File,
+      { path: fileB } as Express.Multer.File,
+    ]);
+
+    await expect(access(fileA)).rejects.toBeDefined();
+    await expect(access(fileB)).rejects.toBeDefined();
   });
 });

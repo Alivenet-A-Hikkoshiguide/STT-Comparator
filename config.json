@@ -31,8 +31,28 @@
     }
   },
   "providers": ["deepgram", "elevenlabs", "local_whisper", "whisper_streaming", "openai"],
+  "jobs": {
+    "maxParallel": 4,
+    "retentionMs": 600000,
+    "persistenceMode": "required",
+    "stateDbPath": "./runs/job-state/batch-jobs.sqlite",
+    "providerMaxParallel": {
+      "deepgram": 3,
+      "elevenlabs": 2,
+      "openai": 2,
+      "local_whisper": 1,
+      "whisper_streaming": 2
+    },
+    "retry": {
+      "maxAttempts": 3,
+      "baseDelayMs": 1000,
+      "maxDelayMs": 10000
+    }
+  },
   "providerHealth": {
-    "refreshMs": 5000
+    "refreshMs": 5000,
+    "failureThreshold": 3,
+    "cooldownMs": 30000
   },
   "voice": {
     "memoryPath": "./voice-memory.txt",
@@ -55,10 +75,23 @@
       "echoSimilarity": 0.8,
       "introEnabled": true,
       "introText": "質問は「アシスタント」と呼びかけてから続けて話してください。"
+    },
+    "tts": {
+      "strategy": "segment-buffered",
+      "segmentMinChars": 40,
+      "segmentMaxChars": 140,
+      "retryMax": 2,
+      "retryBaseMs": 250
     }
   },
   "ws": {
     "maxPcmQueueBytes": 5242880,
+    "preview": {
+      "maxUploadBytes": 125829120
+    },
+    "replay": {
+      "maxUploadBytes": 209715200
+    },
     "compare": {
       "backlogSoft": 8,
       "backlogHard": 32,

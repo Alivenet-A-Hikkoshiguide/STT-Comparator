@@ -91,7 +91,7 @@ Adapters: deepgram / elevenlabs / openai / local_whisper（Batchのみ） / whis
 - Web UI: マイク制御、WS接続、部分／確定表示、条件選択、バッチ評価UI、結果可視化。
   - 句読点ポリシー（none/basic/full）をUIで切替可能。
 - Voice Agent: STT/LLM/TTS の簡易対話、barge-in、会議音声入力／出力のルーティング。
-- Transmux: 互換モード（webm/opus 等）の場合は FFmpeg → PCM(16k mono, linear16) 変換し Adapter に送る。preview/replay/batch のアップロードファイルも受信直後に FFmpeg の strict フラグ（`-v error -xerror -err_detect explode` など）で 16k mono PCM WAV に正規化し、デコードエラーや 100ms 未満の出力しか得られない壊れた音源は **preview/replay では 422**（`AUDIO_UNSUPPORTED_FORMAT` / `AUDIO_TOO_LONG`）で拒否し、batch はファイル単位で失敗として記録する。必要に応じて strict decode 失敗時に degraded 変換へフォールバックし、`degraded:true` を返す。正規化パラメータは `config.json.ingressNormalize`（サンプルレート/チャンネル/ピークヘッドルーム）で統一管理する。
+- Transmux: 互換モード（webm/opus 等）の場合は FFmpeg → PCM(16k mono, linear16) 変換し Adapter に送る。preview/replay/batch のアップロードファイルも受信直後に FFmpeg の strict フラグ（`-v error -xerror -err_detect explode` など）で 16k mono PCM WAV に正規化し、デコードエラーや 100ms 未満の出力しか得られない壊れた音源は **preview/replay では 422**（`AUDIO_UNSUPPORTED_FORMAT` / `AUDIO_TOO_LONG`）で拒否する。batch は投入時に拡張子/MIME を検証し、非音声ファイルを含む場合は 400 でジョブ作成を拒否し、実行中のデコード失敗はファイル単位で失敗として記録する。必要に応じて strict decode 失敗時に degraded 変換へフォールバックし、`degraded:true` を返す。正規化パラメータは `config.json.ingressNormalize`（サンプルレート/チャンネル/ピークヘッドルーム）で統一管理する。
 - Router: ProviderId 解決、セッションライフサイクル管理、コンテキスト管理。
 - Provider Adapter: API/SDK/WS/gRPC への接続、PCM送信、結果正規化、supportsStreaming/batch を表現。
 - Scoring: 正規化、CER/WER/RTF 算出、レイテンシ算出、p50/p95 集計。
@@ -112,7 +112,7 @@ Adapters: deepgram / elevenlabs / openai / local_whisper（Batchのみ） / whis
 8. Stop で Worklet 停止 → Adapter end → WS close。
 
 ### 8.2 バッチ
-1. UI で files[] と ref_json（任意）を指定し Run。並列度 options.parallel は「同時に処理するファイル数」を意味し、複数プロバイダー指定時はサーバ側で provider 数までは自動で引き上げ（config.jobs.maxParallel を上限）て同一ファイルを並列に転写し、公平な比較を担保する。
+1. UI で files[] と ref_json（任意）を指定し Run。並列度 options.parallel は「同時に処理するファイル数」を意味し、複数プロバイダー指定時はサーバ側で provider 数までは自動で引き上げ（config.jobs.maxParallel を上限）て同一ファイルを並列に転写し、公平な比較を担保する。`jobs.maxParallel` はジョブ単位ではなくサーバ全体の同時実行上限として適用する。
 2. POST `/api/jobs/transcribe` (multipart/form-data): files[], provider, lang, ref_json, options。
 3. サーバ: jobId 発行 → 各ファイルを FFmpeg で PCM 化 → Adapter.transcribeFileFromPCM → Scoring → Storage に保存。
 4. UI: GET `/api/jobs/:jobId/status` で進捗ポーリング。
@@ -168,14 +168,21 @@ Adapters: deepgram / elevenlabs / openai / local_whisper（Batchのみ） / whis
 - POST `/api/jobs/transcribe` (multipart/form-data): files[], (provider | providers), lang, ref_json (任意), options (任意)
   - `provider`: 単一プロバイダ
   - `providers`: 複数プロバイダ（同一ファイルを同条件で並列評価し、結果は provider ごとに1行ずつ返る）
+  - 非音声ファイルが混在する場合は 400（`invalidFiles[]`）を返し、ジョブは作成しない。
+  - `ref_json` 指定時はジョブ投入前に manifest coverage を検証し、マッピング不能がある場合は 400（`missingFiles[]`, `ambiguousFiles[]`）を返す。
   - Response: `{ "jobId": "uuid", "queued": 10 }`
-- GET `/api/jobs` → ジョブ履歴一覧
-- GET `/api/jobs/:jobId/status` → `{ jobId, total, done, failed }`
+- GET `/api/jobs` → ジョブ履歴一覧（`status/done/failed/errors/warnings` を含み、結果0件の完全失敗ジョブも返す）
+- GET `/api/jobs/:jobId/status` → `{ jobId, total, done, failed, status, providers, errors, warnings }`
+  - `warnings[]`: `{ code, message, createdAt, details? }`
+  - `code='parallel_clamped'`: 要求並列度が `jobs.maxParallel` / CPU 上限で抑制されたことを通知。
+  - `code='degraded_audio_detected'`: degraded 正規化が混在したことを通知（比較時に要確認）。
 - GET `/api/jobs/:jobId/results?format=csv|json`
-  - CSV カラム: path,provider,lang,cer,wer,rtf,latency_ms,degraded,normalization,text,ref_text
-  - JSON 例: `{ path, provider, lang, durationSec, processingTimeMs, rtf, cer, wer, latencyMs, text, refText, normalizationUsed, vendorProcessingMs, createdAt, opts }`
+  - CSV カラム: path,provider,lang,cer,wer,rtf,latency_ms,audio_sample_rate_hz,audio_channels,audio_encoding,degraded,normalization,text,ref_text
+  - JSON 例: `{ path, provider, lang, durationSec, processingTimeMs, rtf, cer, wer, latencyMs, text, refText, normalizationUsed, vendorProcessingMs, audioSpec, createdAt, opts }`
   - CSVはsnake_case、JSONはcamelCase。
-- GET `/api/jobs/:jobId/summary` → `{ count, cer:{n,avg,p50,p95}, wer:{...}, rtf:{...}, latencyMs:{...} }`
+- GET `/api/jobs/:jobId/summary` → `{ count, cer:{n,avg,p50,p95}, wer:{...}, rtf:{...}, latencyMs:{...}, degraded:{count,ratio} }`
+  - `degraded.count`: degraded 正規化が使われた結果件数
+  - `degraded.ratio`: `degraded.count / count`
   - `groupBy=provider` を指定すると provider 別集計を返す。
 - GET `/api/realtime/latency?limit=20` → 直近セッションのレイテンシ集計
 - GET `/api/realtime/log-sessions?limit=50` → セッション一覧
@@ -214,7 +221,7 @@ Adapters: deepgram / elevenlabs / openai / local_whisper（Batchのみ） / whis
 - 起動: `pnpm replay:realtime --provider mock --language ja-JP --file sample-data/your.wav`（`--manifest sample-data/manifest.example.json` も可）。`--enable-interim`/`--normalize-preset`/`--punctuation`/`--context`/`--dictionary` や `--dry-run` により、StreamingConfigMessage のパラメタを UI と同じ感覚で調整できます。
 - 出力: `StreamTranscriptMessage` を受信するたびに `latencyMs` を含むログ行（`interim` と `final`）、最後に平均/p95/最大の latency 要約、transcript count、final count を表示します。`GET /api/realtime/latency?limit=20` と併せて session-level の集計と突合させれば、実験比較の信頼性が高まります。
 - プロバイダごと: Deepgram では `.env` に `DEEPGRAM_API_KEY`、ElevenLabs では `ELEVENLABS_API_KEY`、`whisper_streaming` では faster-whisper-server が起動済みで `WHISPER_STREAMING_READY_URL` が通る状態であることを確認してからスクリプトを叩いてください。`mock` でまず挙動を確認し、必要なら manifest の `items[]` にノイズ・会話・朗読などのサンプルを追加して比較軸を整えてください。
-- items[].audio はアップロード files[] のファイル名と一致させる。マッピング不可は警告/エラー。
+- `items[].audio` はアップロード `files[]` のファイル名と一致させる。`dataset/a.wav` のようにディレクトリ付きで記述しても basename が一意なら照合できるが、basename が複数候補に衝突する場合は曖昧として 400 を返す。
 
 ## 10. 型仕様（TypeScript）
   - v1.0 デフォルト: `deepgram`, `elevenlabs`, `openai`, `local_whisper`, `whisper_streaming`（ローカル常駐 WS/HTTP サーバ, Streaming/Batch 両対応）。`mock` はローカル検証やテスト用途で必要に応じて追加してください。その他は拡張用。
@@ -248,10 +255,6 @@ WHISPER_MODEL=small            # faster-whisper-server へ渡すモデル名
 # VOICE_HISTORY_MAX_TURNS=12
 # 電文が応答しない場合のバッチタイムアウト（ミリ秒）。省略時は 60000。
 ELEVENLABS_BATCH_TIMEOUT_MS=60000
-# 再試行を増やすには以下の値を設定。いずれも省略時は 3 回 / 拡張バックオフ（1000ms → 5000ms）です。
-ELEVENLABS_BATCH_MAX_ATTEMPTS=3
-ELEVENLABS_BATCH_BASE_DELAY_MS=1000
-ELEVENLABS_BATCH_MAX_DELAY_MS=5000
 # 以下は拡張時に使用（デフォルトでは未使用）
 # AZURE_SPEECH_KEY=...
 # AZURE_SPEECH_REGION=...
@@ -285,6 +288,31 @@ ELEVENLABS_BATCH_MAX_DELAY_MS=5000
         "minSpeechFrames": 2,
         "speechRatio": 0.3
       }
+    },
+    "tts": {
+      "strategy": "segment-buffered",
+      "segmentMinChars": 40,
+      "segmentMaxChars": 140,
+      "retryMax": 2,
+      "retryBaseMs": 250
+    }
+  },
+  "jobs": {
+    "maxParallel": 4,
+    "retentionMs": 600000,
+    "persistenceMode": "required",
+    "stateDbPath": "./runs/job-state/batch-jobs.sqlite",
+    "providerMaxParallel": {
+      "openai": 2,
+      "deepgram": 3,
+      "elevenlabs": 2,
+      "local_whisper": 1,
+      "whisper_streaming": 2
+    },
+    "retry": {
+      "maxAttempts": 3,
+      "baseDelayMs": 1000,
+      "maxDelayMs": 10000
     }
   },
   "ws": {
@@ -296,8 +324,12 @@ ELEVENLABS_BATCH_MAX_DELAY_MS=5000
       "maxPcmQueueBytes": 10485760,
       "overflowGraceMs": 1000
     },
+    "preview": {
+      "maxUploadBytes": 125829120
+    },
     "replay": {
-      "minDurationMs": 100
+      "minDurationMs": 100,
+      "maxUploadBytes": 209715200
     },
     "compare": { "backlogSoft": 8, "backlogHard": 32, "maxDropMs": 1000 } // Realtime比較用バックログ制御
   },
@@ -308,13 +340,22 @@ ELEVENLABS_BATCH_MAX_DELAY_MS=5000
 ```
 - 日本語CERでプロバイダが空白を挿入してしまうケースを吸収したい場合は、評価マニフェスト（ref_json）側で `normalization.stripSpace=true` を指定してください（ジョブ単位で切替可能）。
 - 音声会話の事前記憶は `VOICE_MEMORY_PATH` または `voice.memoryPath` にテキストファイルを指定し、system prompt に追記してセッション開始時に読み込まれます。
+- 音声会話の TTS 安定化は `config.voice.tts` でセグメント分割/再試行を調整可能。`strategy: "segment-buffered"` はストリーム断を吸収する代わりに TTFB が伸びます。
 - `storage.path` は `{date}` プレースホルダを含められ、`YYYY-MM-DD` に展開される（例: `./runs/{date}`）。展開はサーバ起動時に行われるため、日付跨ぎで切り替えるには再起動が必要。
+- `jobs.stateDbPath` はバッチ進捗DBの固定パス（既定: `./runs/job-state/batch-jobs.sqlite`）。`{date}` は使用できない。
+- `jobs.persistenceMode` は `required` 固定。進捗DBの初期化に失敗した場合はサーバ起動を停止する。
+- 旧 `runs/<date>/batch-jobs.sqlite` を移行する場合は、起動前に `pnpm migrate:job-state -- --from <legacy-db> --to ./runs/job-state/batch-jobs.sqlite` を実行する（起動時の自動シードは行わない）。
 - `providerLimits.batchMaxBytes` はプロバイダごとのアップロード上限（バイト）を上書きできる。
+- `jobs.maxParallel` はバッチ全体の同時実行上限（CPUコア数と小さい方が実効値）を指定する。
+- `jobs.providerMaxParallel` はサーバ内で実行中の**全ジョブ合算**でのプロバイダ別同時実行上限を指定する（外部APIの429回避に有効）。
+- `jobs.retry` は batch の一時障害（timeout/429/5xx 等）に対する唯一のリトライ設定（アダプタ側の独自再試行は行わない）。
+- バッチジョブの進捗メタデータは `jobs.stateDbPath` に永続化され、プロセス再起動時に `queued/running` のタスクを自動再開する。
 - `ws.keepaliveMs` / `ws.maxMissedPongs` は WS の疎通監視設定。
 - `ws.overflowGraceMs` はリアルタイム PCM キュー超過時の猶予時間。
 - `ws.meeting.*` は meetingMode のみ適用される上書き設定。
+- `ws.preview.maxUploadBytes` / `ws.replay.maxUploadBytes` は preview/replay のアップロード上限（バイト）。
 - `ws.replay.minDurationMs` は内部再生の最低再生時間（短すぎる音源の誤検知防止）。
-- `providerHealth.refreshMs` を指定すると `/api/providers` のヘルスチェック結果を再計算する間隔（ミリ秒）を調整できます。デフォルト 5000 によりローカルの `whisper_streaming` 等を起動した直後でも数秒で「利用可能」へ切り替わるようになり、同エンドポイントは TTL 内でキャッシュを再利用して過剰なヘルスチェックを防ぎます。即時再評価が必要なときは `/api/admin/reload-config` を叩いてください。
+- `providerHealth.refreshMs` は `/api/providers` のヘルスチェック再計算間隔（ms）を調整する。`providerHealth.failureThreshold` と `providerHealth.cooldownMs` は batch 実行中の連続失敗を一時的な unavailable に反映するしきい値/クールダウンで、障害中プロバイダへの再投入を抑制する。
 - `/api/providers` のレスポンスには `supportsDictionaryPhrases` / `supportsPunctuationPolicy` / `supportsContextPhrases` のようなフラグも含まれるため、クライアントはプロバイダごとの機能差を UI 表示や辞書・句読点コントロールの有効/無効に反映できます。
 
 ## 12. 音声処理ポリシー

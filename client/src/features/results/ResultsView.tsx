@@ -183,7 +183,7 @@ export const ResultsView = ({
               </option>
               {jobHistory.map((entry) => (
                 <option key={entry.jobId} value={entry.jobId}>
-                  {`${(entry.providers ?? [entry.provider]).join(' vs ')} (${entry.total}件) ${new Date(entry.updatedAt).toLocaleString()}`}
+                  {`${(entry.providers ?? [entry.provider]).join(' vs ')} [${entry.status ?? 'completed'}] ${entry.done ?? 0}/${entry.total} (failed:${entry.failed ?? 0}) ${new Date(entry.updatedAt).toLocaleString()}`}
                 </option>
               ))}
             </select>
@@ -216,7 +216,7 @@ export const ResultsView = ({
             最新ジョブID: {lastJobId ?? 'なし'}
             {selectedHistoryEntry && (
               <span style={{ marginLeft: 8 }}>
-                ({(selectedHistoryEntry.providers ?? [selectedHistoryEntry.provider]).join(' vs ')} · {new Date(selectedHistoryEntry.updatedAt).toLocaleString()})
+                ({(selectedHistoryEntry.providers ?? [selectedHistoryEntry.provider]).join(' vs ')} · {selectedHistoryEntry.status ?? 'completed'} · {new Date(selectedHistoryEntry.updatedAt).toLocaleString()})
               </span>
             )}
             <div style={{ marginTop: 4, fontSize: '0.85rem' }}>正規化: {normalizationLabel}</div>
@@ -236,6 +236,13 @@ export const ResultsView = ({
             <StatCard title="平均 WER (単語誤り率)" value={fmt(summaryForDisplay?.wer.avg)} />
             <StatCard title="平均 RTF (実時間係数)" value={fmt(summaryForDisplay?.rtf.avg)} />
             <StatCard title="平均 レイテンシ" value={fmt(summaryForDisplay?.latencyMs.avg)} unit="ms" />
+            <StatCard title="Degraded 件数" value={String(summaryForDisplay?.degraded.count ?? 0)} />
+            <StatCard
+              title="Degraded 比率"
+              value={
+                summaryForDisplay ? `${(summaryForDisplay.degraded.ratio * 100).toFixed(1)}%` : '0.0%'
+              }
+            />
           </div>
         </>
       )}

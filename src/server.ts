@@ -21,8 +21,9 @@ import { loadEnvironment, reloadEnvironment } from './utils/env.js';
 import { BatchRunner } from './jobs/batchRunner.js';
 import { JobExportService } from './jobs/jobExportService.js';
 import { JobHistory } from './jobs/jobHistory.js';
-import { parseManifest } from './utils/manifest.js';
-import { toCsv } from './storage/csvExporter.js';
+import { PersistentBatchJobStore } from './jobs/persistentBatchJobStore.js';
+import { parseManifest, validateManifestCoverage } from './utils/manifest.js';
+import { toCsvStream } from './storage/csvExporter.js';
 import { summarizeJob, summarizeJobByProvider } from './utils/summary.js';
 import { requireProviderAvailable } from './utils/providerStatus.js';
 import { ProviderAvailabilityCache } from './utils/providerAvailabilityCache.js';
@@ -31,6 +32,7 @@ import { transcriptionOptionsSchema } from './validation.js';
 import { PreviewStore } from './replay/previewStore.js';
 import { AudioDecodeError } from './utils/audioNormalizer.js';
 import { ensureNormalizedAudio, AudioValidationError } from './utils/audioIngress.js';
+import { findInvalidAudioUploads, getAllowedAudioExtensions } from './utils/audioUploadValidation.js';
 import { assertFfmpegAvailable } from './utils/ffmpeg.js';
 import type {
   ProviderId,
@@ -71,6 +73,24 @@ interface ParsedBatchRequest {
   options?: TranscriptionOptions;
 }
 
+function normalizeLanguageTag(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isLanguageCompatible(requestedLang: string, manifestLang: string): boolean {
+  const requested = normalizeLanguageTag(requestedLang);
+  const manifest = normalizeLanguageTag(manifestLang);
+  if (!requested || !manifest) {
+    return false;
+  }
+  if (requested === manifest) {
+    return true;
+  }
+  const requestedPrimary = requested.split('-')[0] ?? '';
+  const manifestPrimary = manifest.split('-')[0] ?? '';
+  return requestedPrimary.length > 0 && requestedPrimary === manifestPrimary;
+}
+
 export function parseBatchRequest(
   req: express.Request,
   providerAvailability: ProviderAvailability[],
@@ -79,15 +99,27 @@ export function parseBatchRequest(
   const files = (req.files as Express.Multer.File[]) ?? [];
   const provider = req.body.provider as ProviderId | undefined;
   const providersRaw = req.body.providers as string | string[] | undefined;
-  const lang = req.body.lang as string;
+  const langRaw = req.body.lang as string | undefined;
   if (!provider && !providersRaw) {
     throw new HttpError(400, 'provider or providers is required');
   }
-  if (!lang) {
+  if (!langRaw || langRaw.trim().length === 0) {
     throw new HttpError(400, 'lang is required');
   }
+  const requestedLang = langRaw.trim();
   if (files.length === 0) {
     throw new HttpError(400, 'no files uploaded');
+  }
+  const invalidFiles = findInvalidAudioUploads(files);
+  if (invalidFiles.length > 0) {
+    throw new HttpError(
+      400,
+      'unsupported file type detected; upload audio files only',
+      {
+        invalidFiles,
+        allowedExtensions: getAllowedAudioExtensions(),
+      }
+    );
   }
 
   const providers = (() => {
@@ -132,6 +164,29 @@ export function parseBatchRequest(
     } catch (err) {
       throw new HttpError(400, `invalid ref_json: ${(err as Error).message}`);
     }
+    if (!manifest.language || manifest.language.trim().length === 0) {
+      throw new HttpError(400, 'manifest.language is required');
+    }
+    if (!isLanguageCompatible(requestedLang, manifest.language)) {
+      throw new HttpError(
+        400,
+        `lang mismatch: request lang "${requestedLang}" must match manifest.language "${manifest.language}"`
+      );
+    }
+    const coverage = validateManifestCoverage(
+      manifest,
+      files.map((file) => file.originalname)
+    );
+    if (coverage.missingFiles.length > 0 || coverage.ambiguousFiles.length > 0) {
+      throw new HttpError(
+        400,
+        'manifest items could not be matched to uploaded files',
+        {
+          missingFiles: coverage.missingFiles,
+          ambiguousFiles: coverage.ambiguousFiles,
+        }
+      );
+    }
   }
 
   let options: TranscriptionOptions | undefined;
@@ -157,7 +212,8 @@ export function parseBatchRequest(
     }
   }
 
-  return { files, providers, provider: providers[0], lang, manifest, options };
+  const effectiveLang = manifest?.language?.trim() || requestedLang;
+  return { files, providers, provider: providers[0], lang: effectiveLang, manifest, options };
 }
 
 export function createRealtimeLatencyHandler(
@@ -211,6 +267,20 @@ function isOriginAllowed(origin: string | undefined, allowed: string[]): boolean
   return allowed.includes(origin);
 }
 
+function resolveJobStateDbPath(config: AppConfig): string {
+  return path.resolve(config.jobs.stateDbPath);
+}
+
+export async function cleanupUploadedFiles(files: Express.Multer.File[] | undefined): Promise<void> {
+  if (!files?.length) return;
+  await Promise.all(
+    files
+      .map((file) => file.path)
+      .filter((filePath): filePath is string => Boolean(filePath))
+      .map((filePath) => unlink(filePath).catch(() => undefined))
+  );
+}
+
 async function bootstrap() {
   const app = express();
   const upload = multer({
@@ -243,7 +313,15 @@ async function bootstrap() {
   const jobHistory = new JobHistory(storage);
   await jobHistory.init();
   const jobExporter = new JobExportService(config.storage.path);
-  const batchRunner = new BatchRunner(storage, jobHistory, jobExporter);
+  const jobStateDbPath = resolveJobStateDbPath(config);
+  const batchJobStore = new PersistentBatchJobStore(jobStateDbPath);
+  const batchRunner = new BatchRunner(
+    storage,
+    jobHistory,
+    jobExporter,
+    batchJobStore,
+    providerStatusCache
+  );
   await batchRunner.init();
   await realtimeLatencyStore.init();
   await realtimeTranscriptLogStore.init();
@@ -319,7 +397,7 @@ async function bootstrap() {
       res.json({
         status: 'ok',
         providers: refreshedProviders,
-        note: 'storage driver/path are not re-instantiated; restart required to change storage settings',
+        note: 'storage/job-state stores are not re-instantiated; restart required to change storage settings',
       });
     } catch (error) {
       next(error as Error);
@@ -327,6 +405,7 @@ async function bootstrap() {
   });
 
   app.post('/api/jobs/transcribe', upload.array('files'), async (req, res, next) => {
+    let handedOffToRunner = false;
     try {
       const providerAvailability = await providerStatusCache.get();
       const parsed = parseBatchRequest(req, providerAvailability, config);
@@ -346,8 +425,12 @@ async function bootstrap() {
         parsed.manifest,
         parsed.options
       );
+      handedOffToRunner = true;
       res.json(job);
     } catch (error) {
+      if (!handedOffToRunner) {
+        await cleanupUploadedFiles(req.files as Express.Multer.File[] | undefined);
+      }
       if (error instanceof HttpError) {
         res.status(error.statusCode).json(error.payload ?? { message: error.message });
         return;
@@ -356,13 +439,17 @@ async function bootstrap() {
     }
   });
 
-  app.get('/api/jobs/:jobId/status', (req, res) => {
-    const status = batchRunner.getStatus(req.params.jobId);
-    if (!status) {
-      res.status(404).json({ message: 'Job not found' });
-      return;
+  app.get('/api/jobs/:jobId/status', async (req, res, next) => {
+    try {
+      const status = await batchRunner.getStatusIncludingPersisted(req.params.jobId);
+      if (!status) {
+        res.status(404).json({ message: 'Job not found' });
+        return;
+      }
+      res.json(status);
+    } catch (error) {
+      next(error as Error);
     }
-    res.json(status);
   });
 
   app.get('/api/jobs/:jobId/results', async (req, res) => {
@@ -373,15 +460,31 @@ async function bootstrap() {
     }
     const format = (req.query.format as string) ?? 'json';
     if (format === 'csv') {
-      res.type('text/csv').send(toCsv(results));
+      res.type('text/csv');
+      const csvStream = toCsvStream(results);
+      csvStream.on('error', (error) => {
+        logger.error({
+          event: 'csv_stream_failed',
+          jobId: req.params.jobId,
+          message: error instanceof Error ? error.message : 'csv stream failed',
+        });
+        if (!res.headersSent) {
+          res.status(500).json({ message: 'failed to stream csv' });
+          return;
+        }
+        res.destroy(error instanceof Error ? error : undefined);
+      });
+      csvStream.pipe(res);
       return;
     }
     res.json(results);
   });
 
-  app.get('/api/jobs', async (_req, res, next) => {
+  app.get('/api/jobs', async (req, res, next) => {
     try {
-      const entries = await jobHistory.list();
+      const raw = Number(req.query.limit ?? 200);
+      const limit = Number.isFinite(raw) ? Math.min(1000, Math.max(1, raw)) : 200;
+      const entries = await batchRunner.listJobs(limit);
       res.json(entries);
     } catch (error) {
       next(error as Error);
@@ -462,7 +565,7 @@ async function bootstrap() {
       if (!req.file.size || req.file.size === 0) {
         throw new HttpError(400, 'audio file is empty');
       }
-      const maxBytes = 120 * 1024 * 1024;
+      const maxBytes = config.ws?.preview?.maxUploadBytes ?? 120 * 1024 * 1024;
       if (req.file.size > maxBytes) {
         throw new HttpError(413, 'audio file too large for preview');
       }
@@ -583,7 +686,7 @@ async function bootstrap() {
         );
       }
       // Guard extremely long inputs that can hang realtime sockets
-      const maxBytes = 1024 * 1024 * 200; // ~200MB raw wav upper bound (~20+ minutes 16k mono)
+      const maxBytes = config.ws?.replay?.maxUploadBytes ?? 1024 * 1024 * 200;
       if (req.file.size > maxBytes) {
         throw new HttpError(413, 'audio file too large for realtime replay');
       }

@@ -42,6 +42,7 @@ export interface JobStatus {
   total: number;
   done: number;
   failed: number;
+  warnings?: JobWarning[];
 }
 
 export interface SummaryStats {
@@ -51,12 +52,25 @@ export interface SummaryStats {
   p95: number | null;
 }
 
+export interface DegradedSummary {
+  count: number;
+  ratio: number;
+}
+
+export interface JobWarning {
+  code: 'parallel_clamped' | 'degraded_audio_detected';
+  message: string;
+  createdAt: string;
+  details?: Record<string, unknown>;
+}
+
 export interface JobSummary {
   count: number;
   cer: SummaryStats;
   wer: SummaryStats;
   rtf: SummaryStats;
   latencyMs: SummaryStats;
+  degraded: DegradedSummary;
 }
 
 export interface NormalizationConfig {
@@ -74,6 +88,12 @@ export interface JobHistoryEntry {
   createdAt: string;
   updatedAt: string;
   total: number;
+  done?: number;
+  failed?: number;
+  status?: 'queued' | 'running' | 'completed' | 'failed';
+  resultCount?: number;
+  errors?: Array<{ file: string; message: string }>;
+  warnings?: JobWarning[];
   summary: JobSummary;
   summaryByProvider?: Record<string, JobSummary>;
 }
@@ -209,7 +229,7 @@ export interface WsPayload {
 export type PunctuationPolicy = 'none' | 'basic' | 'full';
 
 export interface SubmitBatchInput {
-  files: FileList | null;
+  files: File[] | null;
   manifestJson: string;
   providers: string[];
   lang: string;

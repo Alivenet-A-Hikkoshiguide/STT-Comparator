@@ -14,10 +14,22 @@ export interface JobHistoryEntry {
   summaryByProvider?: Record<string, JobSummary>;
 }
 
+interface JobHistoryOptions {
+  syncIntervalMs?: number;
+}
+
 export class JobHistory {
   private readonly rowsByJob = new Map<string, BatchJobFileResult[]>();
+  private readonly entriesByJob = new Map<string, JobHistoryEntry>();
+  private readonly syncIntervalMs: number;
+  private lastSyncAt = 0;
 
-  constructor(private readonly storage: StorageDriver<BatchJobFileResult>) {}
+  constructor(
+    private readonly storage: StorageDriver<BatchJobFileResult>,
+    options?: JobHistoryOptions
+  ) {
+    this.syncIntervalMs = options?.syncIntervalMs ?? 30_000;
+  }
 
   async init(): Promise<void> {
     await this.storage.init();
@@ -29,13 +41,12 @@ export class JobHistory {
     const bucket = this.rowsByJob.get(record.jobId) ?? [];
     bucket.push(record);
     this.rowsByJob.set(record.jobId, bucket);
+    this.upsertEntry(record.jobId, bucket);
   }
 
   async list(): Promise<JobHistoryEntry[]> {
     await this.syncWithStorage();
-    return [...this.rowsByJob.entries()]
-      .map(([jobId, rows]) => this.buildEntry(jobId, rows))
-      .filter((entry): entry is JobHistoryEntry => Boolean(entry))
+    return [...this.entriesByJob.values()]
       .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   }
 
@@ -99,28 +110,59 @@ export class JobHistory {
 
   private rebuildFrom(rows: BatchJobFileResult[]): void {
     this.rowsByJob.clear();
+    this.entriesByJob.clear();
     for (const [jobId, records] of this.mapByJob(rows)) {
       this.rowsByJob.set(jobId, records);
+      this.upsertEntry(jobId, records);
     }
   }
 
   private async rebuild(): Promise<void> {
     const all = await this.storage.readAll();
     this.rebuildFrom(all);
+    this.lastSyncAt = Date.now();
   }
 
   private async syncWithStorage(): Promise<void> {
-    const currentRows = await this.storage.readAll();
-    const grouped = this.mapByJob(currentRows);
+    const now = Date.now();
+    if (now - this.lastSyncAt < this.syncIntervalMs) {
+      return;
+    }
 
-    // align in-memory map with storage contents in linear time
-    for (const jobId of [...this.rowsByJob.keys()]) {
-      if (!grouped.has(jobId)) {
-        this.rowsByJob.delete(jobId);
+    if (typeof this.storage.listJobIds === 'function' && typeof this.storage.readByJob === 'function') {
+      const ids = new Set((await this.storage.listJobIds()).filter((id) => id.length > 0));
+      for (const jobId of [...this.rowsByJob.keys()]) {
+        if (!ids.has(jobId)) {
+          this.rowsByJob.delete(jobId);
+          this.entriesByJob.delete(jobId);
+        }
       }
+      for (const jobId of ids) {
+        if (this.rowsByJob.has(jobId)) {
+          continue;
+        }
+        const rows = await this.storage.readByJob(jobId);
+        if (rows.length === 0) {
+          continue;
+        }
+        this.rowsByJob.set(jobId, rows);
+        this.upsertEntry(jobId, rows);
+      }
+      this.lastSyncAt = now;
+      return;
     }
-    for (const [jobId, records] of grouped) {
-      this.rowsByJob.set(jobId, records);
+
+    const currentRows = await this.storage.readAll();
+    this.rebuildFrom(currentRows);
+    this.lastSyncAt = now;
+  }
+
+  private upsertEntry(jobId: string, rows: BatchJobFileResult[]): void {
+    const entry = this.buildEntry(jobId, rows);
+    if (!entry) {
+      this.entriesByJob.delete(jobId);
+      return;
     }
+    this.entriesByJob.set(jobId, entry);
   }
 }

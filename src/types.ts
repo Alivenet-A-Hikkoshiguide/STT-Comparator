@@ -137,6 +137,7 @@ export interface ProviderAdapter {
   supportsStreaming: boolean;
   supportsBatch: boolean;
   startStreaming(opts: StreamingOptions): Promise<StreamingSession>;
+  transcribePcmBuffer?(pcm: Buffer, opts: StreamingOptions): Promise<BatchResult>;
   transcribeFileFromPCM(
     pcm: NodeJS.ReadableStream,
     opts: StreamingOptions
@@ -374,6 +375,13 @@ export interface StorageDriver<T> {
   readAll(): Promise<T[]>;
   readRecent?(limit: number): Promise<T[]>;
   readByJob?(jobId: string): Promise<T[]>;
+  listJobIds?(): Promise<string[]>;
+}
+
+export interface BatchAudioSpec {
+  sampleRateHz: number;
+  channels: number;
+  encoding: 'linear16';
 }
 
 export interface BatchJobFileResult {
@@ -402,6 +410,20 @@ export interface BatchJobFileResult {
   createdAt?: string;
   /** Provider-reported processing time (if supplied by adapter) */
   vendorProcessingMs?: number;
+  /** Audio spec actually passed to providers for fairness/audit */
+  audioSpec?: BatchAudioSpec;
+}
+
+export interface JobWarning {
+  code: 'parallel_clamped' | 'degraded_audio_detected';
+  message: string;
+  createdAt: string;
+  details?: Record<string, unknown>;
+}
+
+export interface DegradedSummary {
+  count: number;
+  ratio: number;
 }
 
 export type StorageDriverName = 'jsonl' | 'sqlite';
@@ -420,6 +442,7 @@ export interface JobSummary {
   wer: SummaryStats;
   rtf: SummaryStats;
   latencyMs: SummaryStats;
+  degraded: DegradedSummary;
 }
 
 export interface RealtimeLatencySummary {

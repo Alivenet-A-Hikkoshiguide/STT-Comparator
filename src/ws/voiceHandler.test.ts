@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
+import type * as FsPromises from 'node:fs/promises';
 
 describe('handleVoiceConnection', () => {
   class FakeWebSocket extends EventEmitter {
@@ -106,7 +107,9 @@ describe('handleVoiceConnection', () => {
       normalization: {},
       storage: { driver: 'jsonl', path: './runs' },
       providers: ['elevenlabs'],
+      jobs: { maxParallel: 4, retentionMs: 10 * 60 * 1000, retry: { maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 10_000 } },
       voice: {
+        tts: { strategy: 'stream' },
         meeting: {
           introEnabled: false,
           openWindowMs: 6000,
@@ -116,6 +119,8 @@ describe('handleVoiceConnection', () => {
         },
       },
       ws: { keepaliveMs: 0, maxMissedPongs: 0 },
+      providerHealth: {},
+      providerLimits: {},
     }),
   }));
 
@@ -234,7 +239,7 @@ describe('handleVoiceConnection', () => {
     process.env.VOICE_MEMORY_PATH = '/tmp/voice-memory.txt';
 
     vi.doMock('node:fs/promises', async () => {
-      const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+      const actual = await vi.importActual<typeof FsPromises>('node:fs/promises');
       return {
         ...actual,
         readFile: vi.fn(async () => 'Memory line'),

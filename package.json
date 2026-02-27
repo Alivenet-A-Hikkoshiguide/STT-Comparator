@@ -12,6 +12,7 @@
     "build": "COREPACK_HOME=${COREPACK_HOME:-$(pwd)/.corepack-cache} PNPM_VERSION=10.12.1 sh -c \"corepack prepare pnpm@${PNPM_VERSION} --activate >/dev/null 2>&1 || true; tsc -p tsconfig.build.json && pnpm --filter stt-comparator-client build\"",
     "start": "node dist/server.js",
     "replay:realtime": "tsx scripts/realtime-replay.ts",
+    "migrate:job-state": "tsx scripts/migrate-job-state.ts",
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
     "test": "vitest run",
     "test:all": "pnpm test && pnpm --filter stt-comparator-client test",

@@ -44,4 +44,25 @@ describe('JsonlStore pruning', () => {
 
     await rm(dir, { recursive: true, force: true });
   });
+
+  it('supports readByJob/readRecent/listJobIds without loading full history into caller', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'jsonl-read-by-job-'));
+    const store = new JsonlStore<any>(path.join(dir, 'test.jsonl'));
+    await store.init();
+
+    await store.append({ id: 'a1', jobId: 'job-a', createdAt: new Date().toISOString() });
+    await store.append({ id: 'b1', jobId: 'job-b', createdAt: new Date().toISOString() });
+    await store.append({ id: 'a2', jobId: 'job-a', createdAt: new Date().toISOString() });
+
+    const byJob = await store.readByJob('job-a');
+    expect(byJob.map((row: any) => row.id)).toEqual(['a2', 'a1']);
+
+    const recent = await store.readRecent(2);
+    expect(recent.map((row: any) => row.id)).toEqual(['a2', 'b1']);
+
+    const jobIds = await store.listJobIds();
+    expect(new Set(jobIds)).toEqual(new Set(['job-a', 'job-b']));
+
+    await rm(dir, { recursive: true, force: true });
+  });
 });

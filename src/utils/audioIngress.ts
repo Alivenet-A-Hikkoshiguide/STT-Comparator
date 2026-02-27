@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { normalizeToPcmWav, AudioDecodeError } from './audioNormalizer.js';
+import { FAIR_CHANNELS, FAIR_SAMPLE_RATE_HZ } from '../config.js';
 import type { AppConfig } from '../config.js';
 
 const PCM_FORMAT_TAG = 1;
@@ -175,10 +176,10 @@ export async function ensureNormalizedAudio(
 ): Promise<NormalizedAudio> {
   const { config, allowCache = true, allowFallback = true, tmpDir, peakDbfs } = options;
   const stats = await stat(inputPath);
-  const targetSampleRate = config.ingressNormalize?.targetSampleRate ?? config.audio.targetSampleRate;
-  const targetChannels = config.ingressNormalize?.targetChannels ?? config.audio.targetChannels;
+  const targetSampleRate = FAIR_SAMPLE_RATE_HZ;
+  const targetChannels = FAIR_CHANNELS;
   const enabled = config.ingressNormalize?.enabled ?? true;
-  const headroomDb = peakDbfs ?? config.ingressNormalize?.peakDbfs;
+  const headroomDb = enabled ? peakDbfs ?? config.ingressNormalize?.peakDbfs : undefined;
   const signature = buildSignature(
     inputPath,
     stats.mtimeMs,
@@ -224,10 +225,8 @@ export async function ensureNormalizedAudio(
     }
   }
 
-  // 常にPCMへの変換を保証する：正規化が無効でも非PCMは強制変換。
-  const shouldNormalize = enabled
-    ? !matchesTarget(info, targetSampleRate, targetChannels)
-    : !isPcmWav(info);
+  // 公平比較のため、ingressNormalize.enabled に関係なく 16k/mono(設定値)へ統一する。
+  const shouldNormalize = !matchesTarget(info, targetSampleRate, targetChannels);
 
   let resultPath = inputPath;
   let effectiveDurationSec = typeof durationSec === 'number' ? durationSec : 0;

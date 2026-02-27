@@ -2,6 +2,11 @@ import { ChangeEvent, Dispatch, SetStateAction, useEffect, useMemo, useState } f
 import { Icons } from '../../components/icons';
 import { fmt } from '../../utils/metrics';
 import { ToggleSwitch } from '../../components/ToggleSwitch';
+import {
+  AUDIO_FILE_INPUT_ACCEPT,
+  formatRejectedFilesMessage,
+  partitionAudioFiles,
+} from '../../utils/audioUploadValidation';
 import type { FileResult, JobStatus, PunctuationPolicy, ProviderInfo, SubmitBatchInput } from '../../types/app';
 
 interface BatchViewProps {
@@ -55,7 +60,8 @@ export const BatchView = ({
   jobResults,
   lastJobId,
 }: BatchViewProps) => {
-  const [files, setFiles] = useState<FileList | null>(null);
+  const [files, setFiles] = useState<File[] | null>(null);
+  const [fileSelectionNotice, setFileSelectionNotice] = useState<string | null>(null);
   const [manifestJson, setManifestJson] = useState('');
 
   const primary = useMemo(() => providers.find((item) => item.id === primaryProvider), [providers, primaryProvider]);
@@ -102,9 +108,17 @@ export const BatchView = ({
     if (!jobStatus || jobStatus.total === 0) return 0;
     return Math.round(((jobStatus.done + jobStatus.failed) / jobStatus.total) * 100);
   }, [jobStatus]);
+  const jobWarnings = useMemo(() => jobStatus?.warnings ?? [], [jobStatus]);
 
   const handleFilesChange = (event: ChangeEvent<HTMLInputElement>) => {
-    setFiles(event.target.files);
+    const selected = Array.from(event.target.files ?? []);
+    const { accepted, rejected } = partitionAudioFiles(selected);
+    setFiles(accepted.length > 0 ? accepted : null);
+    if (rejected.length > 0) {
+      setFileSelectionNotice(formatRejectedFilesMessage(rejected));
+      return;
+    }
+    setFileSelectionNotice(null);
   };
 
   const handleSubmit = () => {
@@ -144,8 +158,20 @@ export const BatchView = ({
             <div style={{ color: files && files.length > 0 ? 'var(--text-main)' : 'var(--text-sub)', fontWeight: 500 }}>
               {files && files.length > 0 ? `${files.length} ファイルを選択中` : 'クリックして音声ファイルを選択'}
             </div>
-            <input id="file-upload" type="file" multiple onChange={handleFilesChange} style={{ display: 'none' }} />
+            <input
+              id="file-upload"
+              type="file"
+              accept={AUDIO_FILE_INPUT_ACCEPT}
+              multiple
+              onChange={handleFilesChange}
+              style={{ display: 'none' }}
+            />
           </div>
+          {fileSelectionNotice && (
+            <div className="muted" style={{ fontSize: '0.75rem', color: 'var(--c-warning)' }}>
+              {fileSelectionNotice}
+            </div>
+          )}
         </div>
         <div className="control-group">
           <label>プロバイダー</label>
@@ -273,6 +299,15 @@ export const BatchView = ({
             <span style={{ color: 'var(--success)' }}>成功: <b>{jobStatus.done}</b></span>
             <span style={{ color: 'var(--error)' }}>失敗: <b>{jobStatus.failed}</b></span>
           </div>
+          {jobWarnings.length > 0 && (
+            <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
+              {jobWarnings.map((warning, index) => (
+                <div key={`${warning.code}-${warning.createdAt}-${index}`} className="banner warning" style={{ margin: 0 }}>
+                  <div>{warning.message}</div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

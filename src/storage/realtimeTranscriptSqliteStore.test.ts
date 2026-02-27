@@ -1,22 +1,15 @@
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import type BetterSqlite3 from 'better-sqlite3';
+import Database from 'better-sqlite3';
 import { describe, it, expect } from 'vitest';
 import { RealtimeTranscriptSqliteStore } from './realtimeTranscriptSqliteStore.js';
 import type { RealtimeTranscriptLogEntry } from '../types.js';
 
 let sqliteAvailable = true;
-type DatabaseConstructor = typeof BetterSqlite3;
-let Database: DatabaseConstructor;
 try {
-  Database = require('better-sqlite3');
-  try {
-    const probe = new Database(':memory:');
-    probe.close();
-  } catch {
-    sqliteAvailable = false;
-  }
+  const probe = new Database(':memory:');
+  probe.close();
 } catch {
   sqliteAvailable = false;
 }

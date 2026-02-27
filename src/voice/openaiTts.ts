@@ -5,6 +5,16 @@ import { withTimeoutSignal } from '../utils/abort.js';
 const OPENAI_TTS_URL = 'https://api.openai.com/v1/audio/speech';
 const OPENAI_TTS_INPUT_SAMPLE_RATE = 24_000;
 
+export class OpenAiTtsHttpError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'OpenAiTtsHttpError';
+    this.status = status;
+  }
+}
+
 function requireApiKey(): string {
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
@@ -84,7 +94,7 @@ export async function* streamOpenAiTtsPcm(
     const res = await createTtsResponse(text, apiKey, signal);
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      throw new Error(`OpenAI TTS error (${res.status}): ${detail.slice(0, 300)}`);
+      throw new OpenAiTtsHttpError(res.status, `OpenAI TTS error (${res.status}): ${detail.slice(0, 300)}`);
     }
     if (!res.body) {
       throw new Error('OpenAI TTS response missing body');

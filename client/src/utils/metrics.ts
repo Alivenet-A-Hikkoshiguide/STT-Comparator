@@ -20,10 +20,17 @@ export const summarizeMetric = (values: Array<number | null | undefined>): Summa
   return { n: nums.length, avg, p50: quantile(0.5), p95: quantile(0.95) };
 };
 
-export const summarizeJobLocal = (rows: FileResult[]): JobSummary => ({
-  count: rows.length,
-  cer: summarizeMetric(rows.map((r) => r.cer)),
-  wer: summarizeMetric(rows.map((r) => r.wer)),
-  rtf: summarizeMetric(rows.map((r) => r.rtf)),
-  latencyMs: summarizeMetric(rows.map((r) => r.latencyMs)),
-});
+export const summarizeJobLocal = (rows: FileResult[]): JobSummary => {
+  const degradedCount = rows.reduce((count, row) => (row.degraded ? count + 1 : count), 0);
+  return {
+    count: rows.length,
+    cer: summarizeMetric(rows.map((r) => r.cer)),
+    wer: summarizeMetric(rows.map((r) => r.wer)),
+    rtf: summarizeMetric(rows.map((r) => r.rtf)),
+    latencyMs: summarizeMetric(rows.map((r) => r.latencyMs)),
+    degraded: {
+      count: degradedCount,
+      ratio: rows.length > 0 ? degradedCount / rows.length : 0,
+    },
+  };
+};
