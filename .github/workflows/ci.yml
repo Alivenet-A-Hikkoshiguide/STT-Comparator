@@ -9,9 +9,11 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     env:
-      COREPACK_HOME: ${{ runner.temp }}/.corepack
       PNPM_VERSION: 10.12.1
     steps:
+      - name: Set Corepack home
+        run: echo "COREPACK_HOME=${RUNNER_TEMP}/.corepack" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v4
 
