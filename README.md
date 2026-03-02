@@ -1,5 +1,5 @@
 # STT Comparator
-[![CI](https://github.com/yusuke142529/STT-Comparator/actions/workflows/ci.yml/badge.svg)](https://github.com/yusuke142529/STT-Comparator/actions/workflows/ci.yml)
+[![CI](https://github.com/Alivenet-A-Hikkoshiguide/STT-Comparator/actions/workflows/ci.yml/badge.svg)](https://github.com/Alivenet-A-Hikkoshiguide/STT-Comparator/actions/workflows/ci.yml)
 
 ローカル環境で複数の音声認識（ASR）プロバイダを同一条件で比較・計測するミニアプリです。リアルタイム（マイク入力）とファイル一括バッチを共通UIから操作し、CER/WER/RTF やレイテンシを収集・可視化する v1.0 スペックに基づいて設計しています。
 
